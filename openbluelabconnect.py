@@ -13,19 +13,24 @@ import libscrc
 import random
 import logging
 import binascii
+import pprint
 
+# connect stick setup. this could be automatically detected like the connect software does.
+PORT = '/dev/ttyUSB0'
+BAUD = 115200
+
+# processing is different depending on device.
+#DEVICE_TYPE = 'PRO_CONTROLLER'
+DEVICE_TYPE = 'GUARDIAN'
+GUARDIAN_ID = bytes([9, 9])
+
+# these are for the pro controller.
 BLUELAB_XOR_KEY = [0x6e, 0x67, 0xc5, 0x79, 0xdd, 0x61, 0x02, 0x1a]
 COMMAND_WHO_ARE_YOU = 0
 COMMAND_DATA_1 = 1 # GET_DEVICE_INFO
 COMMAND_DATA_2 = 2 # GET_DEVICE_SETTINGS
 COMMAND_DATA_3 = 3 # GET_DEVICE_CONTROL_ACTIVITY
 COMMAND_GET_DEVICE_POD_SETUP = 4
-
-port = '/dev/ttyUSB0'
-baud = 115200
-
-# expecting 1 device for testing
-discovered_devices = []
 
 def base36encode(number, alphabet='0123456789abcdefghijklmnopqrstuvwxyz'):
     """
@@ -93,11 +98,12 @@ def decode_packet(packet):
 
 def build_packet(command, randomByte):
 	header = bytearray([
-		0x1B
+		0x1B # sync packet
 	])
 
 	data = bytearray([
-		0x00, 0x02, # byteArrayLenPlusOne # shit, had 1 here for a long time, should be 2 (command + randomByte) # should actually be len(cmd+random+data) but we dont support data :)
+		0x00, 
+		0x02, # byteArrayLenPlusOne # shit, had 1 here for a long time, should be 2 (command + randomByte) # should actually be len(cmd+random+data) but we dont support data :)
 		command, # command (who are you)
 		randomByte, # randombyte
 	])
@@ -133,17 +139,47 @@ def keyCodeFrom64BitAddress(address):
 	
 	return base36
 
-def data_receive_callback(xbee_message):
-	print('<- Received data: {}'.format(binascii.hexlify(xbee_message.data)))
-	parse_packet(xbee_message.data)
-
+# discovery callback just prints
 def discovery_callback(remote_device):
-	global discovered_devices
-	print('> Discovered a device!')
-	discovered_devices.append(remote_device)
+	print('> Discovered a device! {}'.format(remote_device))
+
+# we can receive packets and data. packets are lower level, was hoping to find DD packet here for identification of guardian
+# but it didnt turn out to be necessary.
+def packet_receive_callback(packet):
+	packet_type = type(packet).__name__	
+	# currently only care about AT response packets.
+	if 'ATCommResponsePacket' != packet_type:
+		return
+		
+	command_value = 'no data'
+	if packet.command_value:
+		command_value = binascii.hexlify(packet.command_value)
+	print(
+		'<- Received {} packet [{}] [{}] ({}): {}'.format(
+			packet_type, 
+			packet.command,
+			packet.status,
+			command_value,
+			binascii.hexlify(packet.output())
+		)
+	)
+    
+# this is the main data received callback
+def data_receive_callback(xbee_message):
+	print('<- Received data from "{}": {}'.format( 
+		xbee_message.remote_device, 
+		binascii.hexlify(xbee_message.data) 
+	))
+	# packets are different depending on device.
+	# if we supported multiple devices, we could pass the address to parser so we know which device the message was for.
+	# address = xbee_message.remote_device.get_64bit_addr()
+	if 'PRO_CONTROLLER' == DEVICE_TYPE:
+		process_pro_controller_packet(xbee_message.data)
+	else:
+		process_guardian_packet(xbee_message.data)
 
 # packet processing/device specific stuff
-def parse_packet(packet):
+def process_pro_controller_packet(packet):
 	decoded = decode_packet(packet)
 	process_decoded(decoded)
 
@@ -167,7 +203,7 @@ def read_consume_string_from_buf(buf, maxlen):
 	
 	return ret
 
-CONTROL_TYPES = ['CONDUCTIVITY', 'TEMPERATURE', 'PH']
+CONTROL_TYPES = ['CONDUCTIVITY', 'TEMPERATURE', 'PH'] # TIME should be in here too, no?
 PERIPOD_TYPES = ['Test peripod', 'Peripod M3', 'Peripod L3', 'Peripod L4', 'Peripod M4']
 MODES = ['MONITOR', 'CONTROL', 'CALIBRATION', 'SETTINGS']
 DIRECTIONS = ['OFF', 'UP', 'DOWN']
@@ -317,45 +353,161 @@ def process_decoded(decoded):
 	else:
 		print('no handler for command {}'.format(decoded['command']))
 
+def guardian_alarm_status_to_string(status):
+	# this is directly transcribed.
+	status = status.strip().lower()
+	if status.endswith('h'):
+		return 'high'
+	elif status.endswith('l'):
+		return 'low'
+	elif status.endswith('-'):
+		return 'ok'
+	else:
+		return 'off'
+
+def guardian_get_value_range(value, min_value, max_value, delta_value):
+	# delta value specified in ControlType class but is not used for this part.
+	# seems like there is some magic value of "52".
+	# this is directly transcribed, except that we return None in case we are under/over range.
+	try:
+		value = float(value)
+		if value < -100:
+			range = 'error'
+		elif value >= min_value and value != 52:
+			if value > max_value:
+				range = 'over_range'
+			else:
+				range = 'in_range'
+		else:
+			range = 'under_range'
+	except ValueError:
+		# not a float
+		value = value.lower()
+		if 'ur' == value:
+			range = 'under_range'			
+		elif 'or' == value:
+			range = 'over_range'
+		else:
+			range = 'error'
+		# we dont know what the value actually is. bluelab returns min/max in this case but null makes more sense imo.
+		value = None
+		
+	return {
+		'value': value,
+		'range': range
+	}
+def process_guardian_packet(packet):
+	# look for guardian ID bytes in packet
+	pos = packet.find(GUARDIAN_ID)
+	if pos < 0:
+		# packet didnt contain id
+		return
+	offset = pos + len(GUARDIAN_ID)
+	# consume ID
+	parts = packet[offset:].decode().split("\t")
+	# parse. note indexes 2, 4, 5 are not used.
+	
+	# min/max values are hardcoded into bluelab classes depending on parameter.
+	conductivity = guardian_get_value_range(parts[0], 0, 5, 0.1)
+	temperature = guardian_get_value_range(parts[1], 0, 50, 1.0)
+	ph = guardian_get_value_range(parts[3], 0, 14, 0.1)
+	
+	data = {
+		'conductivity': {
+			'value': conductivity['value'],
+			'range': conductivity['range'],
+			'alarm': guardian_alarm_status_to_string(parts[7])
+		},
+		'temperature': {
+			'value': temperature['value'],
+			'range': temperature['range'],
+			'alarm': guardian_alarm_status_to_string(parts[8])
+		},
+		'ph': {
+			'value': ph['value'],
+			'range': ph['range'],
+			'alarm': guardian_alarm_status_to_string(parts[9]),
+			'cal_due': ('due' == parts[6].lower())
+		}
+	}
+	
+	print('Received Guardian Data:')
+	print('\tConductivity:')
+	print('\t\tValue: {}'.format(data['conductivity']['value']))
+	print('\t\tRange: {}'.format(data['conductivity']['range']))
+	print('\t\tAlarm: {}'.format(data['conductivity']['alarm']))
+	print('\tTemperature:')
+	print('\t\tValue: {}'.format(data['temperature']['value']))
+	print('\t\tRange: {}'.format(data['temperature']['range']))
+	print('\t\tAlarm: {}'.format(data['temperature']['alarm']))
+	print('\tpH:')
+	print('\t\tValue: {}'.format(data['ph']['value']))
+	print('\t\tRange: {}'.format(data['ph']['range']))
+	print('\t\tAlarm: {}'.format(data['ph']['alarm']))
+	print('\t\tCal Due: {}'.format(data['ph']['cal_due']))
+	print()
+
+local_device = None
 try:
-	print('Starting on {} @ {}'.format(port, baud))
+	# so we dont actually have to do discovery, unless we want keycode (or to find out which devices are around).
+	# pro controller stuff is done by broadcast, and guardian broadcasts on its own without us doing anything.
+	
+	discovery_time = 10
+
+	print('Starting on {} @ {}'.format(PORT, BAUD))
 
 	# debug logging
-	#utils.enable_logger("digi.xbee")
+	# utils.enable_logger("digi.xbee")
 
 	# "local device" = connect stick
-	device = XBeeDevice(port, baud)
-	device.open()
+	local_device = XBeeDevice(PORT, BAUD)
+	local_device.open()
 
 	# set up the network
-	net = device.get_network()
-	discovery_timeout = 20
-	net.set_discovery_timeout(discovery_timeout)
+	net = local_device.get_network()
+	net.set_discovery_timeout(discovery_time)
+	# append_dd didnt result in us receiving a DD packet...
+	#net.set_discovery_options({DiscoveryOptions.APPEND_DD}) 
 
 	# attach callbacks
-	net.add_device_discovered_callback(discovery_callback)
-	device.add_data_received_callback(data_receive_callback)
+	#net.add_device_discovered_callback(discovery_callback)
+	#local_device.add_packet_received_callback(packet_receive_callback)
+	local_device.add_data_received_callback(data_receive_callback)
 
 	# start discovery
 	net.start_discovery_process()
-	print('Started discovery - wait up to {}s'.format(discovery_timeout))
+	print('Started discovery - waiting {}s'.format(discovery_time))
 
-	while net.is_discovery_running() and not len(discovered_devices):
+	while net.is_discovery_running():
 		time.sleep(0.1)
 			
 	print('Finished discovery')
 	print()
 	
+	discovered_devices = net.get_devices()
+	
 	if len(discovered_devices):
-		for dd in discovered_devices:
-			print('Discovered "{}"'.format(dd))
+		for remote_device in discovered_devices:
+			print('Discovered "{}"'.format(remote_device))
 			# dd and remoteDev appear to be the same thing
 			#dd.read_device_info()
-			addr64 = dd.get_64bit_addr()
+			addr64 = remote_device.get_64bit_addr()
 			print(' addr64: "{}"'.format(addr64))
 			print(' keycode: "{}"'.format(keyCodeFrom64BitAddress(addr64)))
+			print('Sending DD')
+			# needed to set a timeout, whatever the default is is too short.
+			# could do this async too with packetreceived callback.
+			remote_device.set_sync_ops_timeout(3)
+			dd = remote_device.get_parameter('DD')
+			print('Device identified as {}, not sure if this is meaningful'.format(binascii.hexlify(dd)))
 			print()
+			# not sure if this dd value is useful or not. guardian is returning 00030000.
+			# it looks like we can look at the received data packet to determine ID.
+			# maybe wait until the first packet arrives and then determine device?
 			
+		# guardian doesnt seem to respond to these commands. instead it just broadcasts 
+		# its ID and data every few seconds.
+		if 'PRO_CONTROLLER' == DEVICE_TYPE:
 			who_are_you_packet = build_packet(COMMAND_WHO_ARE_YOU, random.randint(0, 255))
 			d1_packet = build_packet(COMMAND_DATA_1, random.randint(0, 255))
 			d2_packet = build_packet(COMMAND_DATA_2, random.randint(0, 255))
@@ -363,23 +515,34 @@ try:
 			packet50 = build_packet(COMMAND_GET_DEVICE_POD_SETUP, 30)
 			
 			print('-> broadcast WHO_ARE_YOU')
-			device.send_data_broadcast(who_are_you_packet)
+			print('-> Send data: {}'.format(binascii.hexlify(who_are_you_packet)))
+			local_device.send_data_broadcast(who_are_you_packet)
 			print()
 			print('-> broadcast GET_DEVICE_INFO')
-			device.send_data_broadcast(d1_packet)
+			local_device.send_data_broadcast(d1_packet)
 			print()
 			print('-> broadcast GET_DEVICE_SETTINGS')
-			device.send_data_broadcast(d2_packet)
+			local_device.send_data_broadcast(d2_packet)
 			print()
 			print('-> broadcast GET_DEVICE_CONTROL_ACTIVITY')
-			device.send_data_broadcast(d3_packet)
+			local_device.send_data_broadcast(d3_packet)
 			print()
 			print('-> broadcast GET_DEVICE_POD_SETUP')
-			device.send_data_broadcast(packet50)
+			local_device.send_data_broadcast(packet50)
+			print()
+		
+		print('Listening for packets, press CTRL+C to stop')
+		print()
+		try:
+			while True:
+				time.sleep(0.1)
+		except KeyboardInterrupt:
+			print()
+			print('Interrupted')
 			print()
 			
 	print('Done!')
 finally:
-	if device is not None and device.is_open():
-		print('Cleaning up...')
-		device.close()
+	if local_device is not None and local_device.is_open():
+		print('Closing connect stick...')
+		local_device.close()
